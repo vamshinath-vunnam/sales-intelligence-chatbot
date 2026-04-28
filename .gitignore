@@ -1,0 +1,6 @@
+.env
+data/sales.db
+__pycache__/
+*.pyc
+.chainlit/
+.files/
