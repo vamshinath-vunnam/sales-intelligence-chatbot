@@ -100,17 +100,20 @@ async def on_message(message: cl.Message):
         await cl.Message(content="Session not initialised. Please refresh.").send()
         return
 
-    # Show typing indicator while processing
-    async with cl.Step(name="Querying sales data...") as step:
-        answer, model_used = await agent.run(
-            user_message=message.content,
-            system_prompt=system_prompt,
-            history=history,
-            mcp_client=mcp_client,
-        )
-        step.output = f"Model: `{model_used}`"
+    # Show a placeholder while the agent works
+    thinking_msg = cl.Message(content="")
+    await thinking_msg.send()
 
-    await cl.Message(content=answer).send()
+    answer, model_used = await agent.run(
+        user_message=message.content,
+        system_prompt=system_prompt,
+        history=history,
+        mcp_client=mcp_client,
+    )
+
+    # Update the placeholder with the real answer
+    thinking_msg.content = answer
+    await thinking_msg.update()
 
     # Update sliding window history
     history.append({"role": "user", "content": message.content})

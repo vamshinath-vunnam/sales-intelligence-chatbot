@@ -1,16 +1,25 @@
 """
 agent.py — Claude API agent loop with MCP tool execution and adaptive model routing.
 
-Authentication:
-  Uses TR AI Platform token exchange (same pattern as gtm-ai_agentic-service).
-  POST https://aiplatform.gcs.int.thomsonreuters.com/v1/anthropic/token
-    → {"workspace_id": WORKSPACE_ID}
-    → returns {"anthropic_api_key": "<short-lived-key>"}
-  Falls back to direct ANTHROPIC_API_KEY if WORKSPACE_ID is not set.
+Authentication (tried in order):
+  1. TR AI Platform token exchange — when WORKSPACE_ID is set in .env
+     POST https://aiplatform.gcs.int.thomsonreuters.com/v1/anthropic/token
+       → {"workspace_id": WORKSPACE_ID}
+       → returns {"anthropic_api_key": "<short-lived-key>"}
+     Token is cached for 3500 seconds and refreshed automatically.
+     Uses httpx with SSL verification disabled (required for TR corporate proxy).
+
+  2. Direct Claude API key — fallback when WORKSPACE_ID is not set
+     Uses ANTHROPIC_API_KEY from .env directly.
+     Uses httpx with SSL verification enabled (standard).
 
 Model routing:
-  - Haiku  → simple, scoped queries (low complexity)
-  - Sonnet → trend analysis, multi-brand/region comparisons (high complexity)
+  - HAIKU_MODEL  → simple, scoped queries (single metric, recent period)
+  - SONNET_MODEL → complex queries (trends, multi-brand/region comparisons)
+
+  On TR AI Platform, only claude-sonnet-4-20250514 is available — both tiers
+  use sonnet. On the direct API, haiku routing is fully enabled via
+  ANTHROPIC_HAIKU_MODEL in .env.
 """
 
 import os
@@ -24,58 +33,96 @@ from src.mcp_client import MCPClient
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# TR AI Platform auth
+# Config
+# ---------------------------------------------------------------------------
+
+# [OPTIONAL] TR AI Platform workspace ID.
+# When set, token exchange is used. When blank, falls back to ANTHROPIC_API_KEY.
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "").strip()
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+# Primary model (sonnet) — used for complex queries and as fallback for haiku
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+
+# Haiku model — used for simple queries when available (direct API only)
+# Falls back to ANTHROPIC_MODEL when not set (e.g. on TR AI Platform)
+ANTHROPIC_HAIKU_MODEL = os.environ.get("ANTHROPIC_HAIKU_MODEL", "").strip() or ANTHROPIC_MODEL
+
+# Determine whether we're running via TR AI Platform or direct API
+_USING_TR_PLATFORM = bool(WORKSPACE_ID)
+
+# ---------------------------------------------------------------------------
+# TR AI Platform token exchange
 # ---------------------------------------------------------------------------
 
 TR_AI_PLATFORM_BASE = "https://aiplatform.gcs.int.thomsonreuters.com/v1/anthropic"
 TOKEN_URL = f"{TR_AI_PLATFORM_BASE}/token"
-TOKEN_TTL_SECONDS = 3500  # tokens are valid ~1 hour; refresh slightly early
+TOKEN_TTL_SECONDS = 3500  # tokens valid ~1 hour; refresh slightly early
 
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-
-# In-memory token cache
+# In-memory cache for the short-lived key
 _api_key_cache: dict = {"key": "", "fetched_at": 0.0}
 
 
 def _fetch_api_key() -> str:
-    """Return a valid Anthropic API key, refreshing via TR AI Platform if needed."""
-    now = time.time()
-    cached = _api_key_cache
-    if cached["key"] and (now - cached["fetched_at"]) < TOKEN_TTL_SECONDS:
-        return cached["key"]
+    """
+    Return a valid Anthropic API key.
 
-    # Fallback: direct API key
-    if not WORKSPACE_ID:
-        direct_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if direct_key:
-            return direct_key
+    If WORKSPACE_ID is set: exchanges it via TR AI Platform and caches the result.
+    Otherwise: returns ANTHROPIC_API_KEY directly.
+    """
+    # --- TR AI Platform path ---
+    if _USING_TR_PLATFORM:
+        now = time.time()
+        cached = _api_key_cache
+        if cached["key"] and (now - cached["fetched_at"]) < TOKEN_TTL_SECONDS:
+            return cached["key"]
+
+        try:
+            resp = requests.post(
+                TOKEN_URL,
+                json={"workspace_id": WORKSPACE_ID},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            creds = resp.json()
+            if "anthropic_api_key" not in creds:
+                raise RuntimeError(f"TR AI Platform returned unexpected response: {creds}")
+
+            _api_key_cache["key"] = creds["anthropic_api_key"]
+            _api_key_cache["fetched_at"] = now
+            return _api_key_cache["key"]
+
+        except Exception as tr_err:
+            # TR platform unavailable — fall back to direct API key if configured
+            if ANTHROPIC_API_KEY:
+                print(f"[auth] TR AI Platform failed ({tr_err}), falling back to ANTHROPIC_API_KEY")
+                return ANTHROPIC_API_KEY
+            raise RuntimeError(
+                f"TR AI Platform token exchange failed and no ANTHROPIC_API_KEY fallback is set. "
+                f"Error: {tr_err}"
+            ) from tr_err
+
+    # --- Direct Claude API key path ---
+    if not ANTHROPIC_API_KEY:
         raise ValueError(
-            "Set WORKSPACE_ID (for TR AI Platform) or ANTHROPIC_API_KEY in .env"
+            "No credentials found. Set WORKSPACE_ID (TR AI Platform) or "
+            "ANTHROPIC_API_KEY (direct Claude API) in .env"
         )
-
-    # Token exchange via TR AI Platform
-    resp = requests.post(
-        TOKEN_URL,
-        json={"workspace_id": WORKSPACE_ID},
-        verify=False,  # corporate proxy — SSL verification disabled
-        timeout=10,
-    )
-    resp.raise_for_status()
-    creds = resp.json()
-    if "anthropic_api_key" not in creds:
-        raise RuntimeError(f"Token endpoint did not return an API key: {creds}")
-
-    _api_key_cache["key"] = creds["anthropic_api_key"]
-    _api_key_cache["fetched_at"] = now
-    return _api_key_cache["key"]
+    return ANTHROPIC_API_KEY
 
 
 def _make_async_client() -> anthropic.AsyncAnthropic:
-    """Create an AsyncAnthropic client with a fresh token and SSL-disabled httpx client."""
+    """
+    Create an AsyncAnthropic client.
+
+    TR AI Platform: SSL verification disabled (required for corporate proxy).
+    Direct API:     SSL verification enabled (standard).
+    """
+    ssl_verify = not _USING_TR_PLATFORM  # False for TR, True for direct API
     return anthropic.AsyncAnthropic(
         api_key=_fetch_api_key(),
-        http_client=httpx.AsyncClient(verify=False),
+        http_client=httpx.AsyncClient(verify=ssl_verify),
     )
 
 
@@ -92,14 +139,13 @@ COMPLEXITY_SIGNALS = {
     "highest", "lowest", "which brand", "all brands",
 }
 
-# Model IDs on TR AI Platform
-# NOTE: TR AI Platform gateway currently exposes claude-sonnet-4-20250514.
-# Routing logic is preserved — swap HAIKU_MODEL to a haiku endpoint when available.
-HAIKU_MODEL = ANTHROPIC_MODEL     # falls back to sonnet on TR AI Platform
-SONNET_MODEL = ANTHROPIC_MODEL    # claude-sonnet-4-20250514
+# Model assignments (resolved from env at startup)
+HAIKU_MODEL = ANTHROPIC_HAIKU_MODEL   # simple queries
+SONNET_MODEL = ANTHROPIC_MODEL        # complex queries
 
 
 def _select_model(user_message: str) -> str:
+    """Route to haiku or sonnet based on query complexity signals."""
     words = set(user_message.lower().split())
     signals_found = words & COMPLEXITY_SIGNALS
     return SONNET_MODEL if len(signals_found) >= 2 else HAIKU_MODEL
@@ -162,7 +208,7 @@ async def run(
 
         break
 
-    # Safety fallback
+    # Safety fallback after max iterations
     return _extract_text(response) if response else "I don't have that data.", model
 
 
