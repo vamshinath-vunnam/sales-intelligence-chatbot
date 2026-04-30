@@ -38,7 +38,10 @@ class MCPClient:
         )
         await self._session.initialize()
 
-        # Cache tool definitions in Anthropic API format
+        # Cache tool definitions in Anthropic API format.
+        # Only expose read_query — the system prompt already tells Claude the
+        # table name and schema, so list_tables/describe_table are unnecessary
+        # and waste tool iterations that count toward MAX_TOOL_ITERATIONS.
         mcp_tools = await self._session.list_tools()
         self._tools = [
             {
@@ -47,6 +50,7 @@ class MCPClient:
                 "input_schema": t.inputSchema,
             }
             for t in mcp_tools.tools
+            if t.name == "read_query"
         ]
 
     async def disconnect(self):

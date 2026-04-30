@@ -155,7 +155,7 @@ def _select_model(user_message: str) -> str:
 # Agent loop
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_ITERATIONS = 6
+MAX_TOOL_ITERATIONS = 10
 
 
 async def run(
